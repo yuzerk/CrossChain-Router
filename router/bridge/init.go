@@ -4,6 +4,7 @@ package bridge
 import (
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -38,6 +39,7 @@ func setRouterInfoLoaded(chainID, routerContract string) {
 }
 
 // InitRouterBridges init router bridges
+//
 //nolint:funlen,gocyclo // ok
 func InitRouterBridges(isServer bool) {
 	log.Info("start init router bridges", "isServer", isServer)
@@ -67,6 +69,142 @@ func InitRouterBridges(isServer bool) {
 			continue
 		}
 		chainIDs = append(chainIDs, chainID)
+	}
+	log.Info("get all chain ids success", "chainIDs", chainIDs)
+	if len(chainIDs) == 0 {
+		logErrFunc("empty chain IDs")
+		return
+	}
+
+	log.Info("start get all token ids")
+	allTokenIDs, err := router.GetAllTokenIDs()
+	if err != nil {
+		logErrFunc("call GetAllTokenIDs failed", "err", err)
+		return
+	}
+	// get rid of blacked tokenIDs
+	tokenIDs := make([]string, 0, len(allTokenIDs))
+	for _, tokenID := range allTokenIDs {
+		if params.IsTokenIDInBlackList(tokenID) {
+			log.Debugf("ingore tokenID %v in black list", tokenID)
+			continue
+		}
+		tokenIDs = append(tokenIDs, tokenID)
+	}
+	log.Info("get all token ids success", "tokenIDs", tokenIDs)
+	if len(tokenIDs) == 0 && !tokens.IsAnyCallRouter() {
+		logErrFunc("empty token IDs")
+		return
+	}
+
+	wg := new(sync.WaitGroup)
+	wg.Add(len(chainIDs))
+	for _, chainID := range chainIDs {
+		go func(wg *sync.WaitGroup, chainID *big.Int) {
+			defer wg.Done()
+
+			bridge := NewCrossChainBridge(chainID)
+
+			InitGatewayConfig(bridge, chainID)
+			if bridge.GetGatewayConfig().IsEmpty() {
+				logErrFunc("bridge has no gateway config", "chainID", chainID)
+				return
+			}
+
+			AdjustGatewayOrder(bridge, chainID.String())
+			InitChainConfig(bridge, chainID)
+
+			bridge.InitAfterConfig()
+			router.SetBridge(chainID.String(), bridge)
+
+			latestBlock, err := bridge.GetLatestBlockNumber()
+			if err != nil {
+				log.Warn("get lastest block number failed", "chainID", chainID, "err", err)
+			} else {
+				log.Infof("[%5v] lastest block number is %v", chainID, latestBlock)
+			}
+
+			if params.GetLocalChainConfig(chainID.String()).ForbidParallelLoading {
+				for _, tokenID := range tokenIDs {
+					log.Info("start load token config", "tokenID", tokenID, "chainID", chainID)
+					InitTokenConfig(bridge, tokenID, chainID)
+				}
+			} else {
+				wg2 := new(sync.WaitGroup)
+				wg2.Add(len(tokenIDs))
+				for _, tokenID := range tokenIDs {
+					go func(wg2 *sync.WaitGroup, tokenID string, chainID *big.Int) {
+						defer wg2.Done()
+						log.Info("start load token config", "tokenID", tokenID, "chainID", chainID)
+						InitTokenConfig(bridge, tokenID, chainID)
+					}(wg2, tokenID, chainID)
+				}
+				wg2.Wait()
+			}
+		}(wg, chainID)
+	}
+	wg.Wait()
+
+	initSwapNonces()
+
+	router.AllChainIDs = chainIDs
+	router.AllTokenIDs = tokenIDs
+
+	router.PrintMultichainTokens()
+
+	loadSwapAndFeeConfigs()
+
+	mpc.Init(isServer)
+
+	success = true
+
+	go WatchGatewayConfig()
+}
+
+// InitRouterBridges init router bridges with filterChainIds
+//
+//nolint:funlen,gocyclo // ok
+func InitRouterBridgesWithFilterChain(isServer bool, filterChainIds []string) {
+	log.Info("start init router bridges", "isServer", isServer)
+	var success bool
+	router.IsIniting = true
+	defer func() {
+		router.IsIniting = false
+		routerInfoIsLoaded = new(sync.Map)
+		log.Info("init router bridges finished", "isServer", isServer, "success", success)
+	}()
+
+	logErrFunc := log.GetLogFuncOr(router.DontPanicInLoading(), log.Error, log.Fatal)
+
+	router.InitRouterConfigClients()
+
+	log.Info("start get all chain ids")
+	allChainIDs, err := router.GetAllChainIDs()
+	if err != nil {
+		logErrFunc("call GetAllChainIDs failed", "err", err)
+		return
+	}
+	// get rid of blacked chainIDs
+	chainIDs := make([]*big.Int, 0, len(allChainIDs))
+	for _, chainID := range allChainIDs {
+		if params.IsChainIDInBlackList(chainID.String()) {
+			log.Debugf("ingore chainID %v in black list", chainID)
+			continue
+		}
+		//filter chainId
+		if filterChainIds != nil && len(filterChainIds) > 0 {
+			for _, filterId := range filterChainIds {
+				chainIdFilter, err := strconv.ParseInt(filterId, 10, 64)
+				if err != nil {
+					continue
+				}
+				if chainID.Cmp(big.NewInt(chainIdFilter)) != 0 {
+					chainIDs = append(chainIDs, chainID)
+				}
+			}
+		} else {
+			chainIDs = append(chainIDs, chainID)
+		}
 	}
 	log.Info("get all chain ids success", "chainIDs", chainIDs)
 	if len(chainIDs) == 0 {
@@ -413,6 +551,7 @@ func InitChainConfig(b tokens.IBridge, chainID *big.Int) {
 }
 
 // InitTokenConfig impl
+//
 //nolint:funlen,gocyclo // allow long init token config method
 func InitTokenConfig(b tokens.IBridge, tokenID string, chainID *big.Int) {
 	isReload := router.IsReloading
