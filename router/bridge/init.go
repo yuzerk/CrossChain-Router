@@ -198,7 +198,7 @@ func InitRouterBridgesWithFilterChain(isServer bool, filterChainIds []string) {
 				if err != nil {
 					continue
 				}
-				if chainID.Cmp(big.NewInt(chainIdFilter)) != 0 {
+				if chainID.Cmp(big.NewInt(chainIdFilter)) == 0 {
 					chainIDs = append(chainIDs, chainID)
 				}
 			}
